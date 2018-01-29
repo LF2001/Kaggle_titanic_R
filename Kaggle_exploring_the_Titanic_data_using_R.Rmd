@@ -1,0 +1,529 @@
+---
+title: "Kaggle_Exploring_the_Titanic_data_using_R"
+author: "LF"
+date: "19/01/2018"
+output:
+  html_document:
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    number_sections: false 
+    theme: cerulean
+    toc_float: true
+    code_folding: show 
+---
+# Introduction
+
+Here I explore the Titanic dataset using the caret package in R. There are four parts to the analysis: (1) Missing value imputation, (2) Feature engineering, (3) Basic data exploration, (4) Model building
+
+## Load and check data
+
+```{r, message = FALSE, warning=FALSE}
+rm(list = ls())
+library(ggplot2) # visualization
+library(ggthemes) # visualization
+library(scales) # visualization
+library(dplyr) # data manipulation
+library(caret) # classification package
+library(fBasics) # for basic measures of data distributions
+```
+
+```{r}
+set.seed(32343)
+titanic <- read.csv('/Users/lewisforder/Documents/repos/Kaggle_Titanic_data/train.csv', stringsAsFactors = F)
+test  <- read.csv('/Users/lewisforder/Documents/repos/Kaggle_Titanic_data/test.csv', stringsAsFactors = F)
+
+titanic$data_type <- 'training' # label the data in case we remove cases later on
+test$data_type <- 'test' 
+```
+
+# Missing values imputation 
+Now let's check the data and look for missing values in the training set and in the test set.
+
+```{r}
+# Double check data types
+sapply(titanic, class)
+
+# Double check presence of missing values in our predictors of interest
+sapply(titanic, function(x) sum(is.na(x)))
+sapply(test, function(x) sum(is.na(x)))
+```
+
+There's a fair amount of missing age values. There's also one missing data value in the Embarked feature in the testing set. Let's double check the median fare value in both training and test sets to check they're comparable and if so let's impute the missing value as the median value.
+
+```{r}
+median(titanic$Fare)
+median(test$Fare, na.rm=TRUE)
+
+which(is.na(test$Fare), arr.ind=TRUE) # get row number
+
+test$Fare[153] <- median(test$Fare, na.rm=TRUE) # impute with median value
+
+```
+
+In fact these median values are identical, a good sign that our test data is (hopefully) an accurate representation of the training data.
+There's also a couple of empty (not NA) values for the embared feature in the training set. We'll remove those rows - there are only two of them so this shouldn't decrease the model accuracy.
+
+```{r}
+# Get row indices of missing data and then remove them
+titanic[which(titanic$Embarked == ''), ]
+
+titanic <- titanic[-c(62, 830), ]
+
+titanic[which(titanic$Embarked == ''), ] # double check the correct rows were removed (there should be no rows returned here)
+```
+
+## Impute missing age data using k-nearest neighbours
+OK, so we've got 177 missing age values in the training dataset and 86 in the testing set. That's too many to remove so let's try and impute these missing data using k-nearest neighbours imputation.
+
+Firstly, let's check how well this procedure works on data for which we do know the correct answer. We can do this by randomly assigning NA to some real age values, carrying out the imputation on these 'known' data, and then comparing this to the real data.
+
+```{r}
+titanic$age_Zscore <- (titanic$Age-mean(titanic$Age, na.rm=TRUE))/sd(titanic$Age, na.rm=TRUE) # make a column of age data as z-scores (the k-nearest neighbours will be z-scores)
+
+Subs1<-subset(titanic, (!is.na(titanic[,6]))) # omit data with NA age values
+
+# And now check for missing age values (there should be none)
+sapply(Subs1, function(x) sum(is.na(x)))
+
+# now randomly make some values NA
+Subs1$Age_Z_NAs <- Subs1$age_Zscore # the capAve variable will be assigned NAs
+selectNA <- rbinom(dim(Subs1)[1],size = 1,prob = 0.2)==1 #use random binomialy function to get index of numbers to be missing. Let's make the same proportion NAs as actual NAs (~ 20% missing)
+Subs1$Age_Z_NAs[selectNA] <- NA #assign NAs to capAve
+
+# And now check for missing age values (there should be some)
+sapply(Subs1, function(x) sum(is.na(x)))
+
+#impute and standardize
+preObj <- preProcess(Subs1[,-1],method = "knnImpute") # apply imputation excluding outcome variable
+ageImput_Z <- predict(preObj,Subs1[,-1])$Age_Z_NAs #predict values including those added with the knn algorithm
+
+#compare the values that were imputed to the values that were truly there before being assigned NA
+quantile(ageImput_Z - Subs1$age_Zscore)
+#(most of the values are near zero so the imputation worked relatively well)
+
+#look at just the values that were imputed, i.e., compare imputed values to true values but only for values that were missing
+quantile((ageImput_Z - Subs1$age_Zscore)[selectNA]) 
+#these are a little larger than !selectNA below as these have been imputed, thus the difference shows how well/badly the knn worked
+
+#look at the values that were not assigned to be NA
+quantile((ageImput_Z - Subs1$age_Zscore)[!selectNA])
+```
+
+The numbers are small so the outcome of the comparison of the imputed data to true data (as Z-scores) suggests the procedure will be suitable for predicting the actual missing age data. Let's re-run the procedure on the full training dataset to predict the missing values
+
+```{r}
+# carry out k-nearest neighbours imputation on the genuine missing age values in the training set
+preObj <- preProcess(titanic[,-1],method = "knnImpute") # apply imputation excluding outcome variable
+ageImput_Z <- predict(preObj,titanic[,-1])$age_Zscore #predict values including those added with the knn algorithm
+
+titanic$age_Zscore_imput <- ageImput_Z # copy imputed data into the dataset
+
+# Double check for missing age values (there should be none in the age_Zscore_imput variable)
+sapply(titanic, function(x) sum(is.na(x)))
+```
+
+Now let's run this procedure on the 'test' dataset. Note, we've obtained Z-scores for the training set, we first need to obtain Z-scores for the testing set for those age data that are not missing. We must base our testing Z-score calculations on the means / SDs of the training set and NOT the means / SDs of the testing set to avoid over-fitting.
+
+```{r}
+test$age_Zscore <- (test$Age-mean(titanic$Age, na.rm=TRUE))/sd(titanic$Age, na.rm=TRUE) # make a column of age data as z-scores (the k-nearest neighbours will be z-scores)
+
+#impute and standardize
+preObj <- preProcess(test[,-1],method = "knnImpute") # apply imputation excluding outcome variable
+ageImput_Z <- predict(preObj,test[,-1])$age_Zscore #predict values including those added with the knn algorithm
+
+test$age_Zscore_imput <- ageImput_Z # copy imputed data into the dataset
+
+# Double check for missing age values (there should be none in the age_Zscore_imput variable)
+sapply(test, function(x) sum(is.na(x)))
+```
+
+And now double check the distribution of the new age data (imputed Z scores) closely matches the original data (Z scores with NAs).
+
+```{r}
+# Plot age distributions
+par(mfrow=c(1,2))
+hist(titanic$age_Zscore, breaks=30, freq=F, main='Age Z-scores: Original Data', col='darkgreen', ylim=c(0,0.6))
+hist(titanic$age_Zscore_imput, breaks=30, freq=F, main='Age Z-scores: k-nearest Output', col='lightgreen', ylim=c(0,0.6))
+```
+
+Looking good. Now let's see how the distribution of the raw age data compares with our new imputed age data.
+
+```{r}
+# Plot age distributions
+par(mfrow=c(1,2))
+hist(titanic$Age, breaks=30, freq=F, main='Age raw: Original Data', 
+  col='darkgreen', ylim=c(0,0.06))
+hist(titanic$age_Zscore_imput, breaks=30, freq=F, main='Age Z-scores: k-nearest Output', 
+  col='lightgreen', ylim=c(0,0.6))
+```
+
+Good - note that the Z-score imputed distribution on the right (which we will use as a feature) appears less positively skewed than the real age data.
+
+Now let's take a look at the distribution of the Fare variable - it might make sense to transform the data if it's heavily skewed. Firstly, let's plot the Fare data.
+
+```{r}
+hist(titanic$Fare, breaks = 30, freq=F, main='Fare raw: Original Data', 
+  col='darkgreen', ylim=c(0,0.05)) 
+```
+
+Yep! This data is very heavily positively skewed with a couple of very high-value outliers. It looks like there's a number of people who paid a fare of zero. Is this missing data? Or did they really get a free ride? Let's assume they got a free ride given that there was an NA value for Fare in the test set (i.e., we have both zero amounts and NAs so it's safe to assume some passengers got a free ride). Let's take a look at the data for those free tickets, I wonder if passengers were more likely to survive if they paid for a ticket?
+
+```{r}
+freeTicket <- titanic[titanic[, "Fare"] == 0,]
+table(survived=freeTicket$Survived)
+```
+
+So 15 people got a free ride, they were all male, their aged ranged from 19 to 49, they all embarked at Southampton, and if we look at the survival rates we can see that only one of them survived. So it appears that a free ticket strongly predicts that a passenger does not survive. If the free tickets did not predict survival I'd suggest removing these passengers so that we can fit a log transform to the Fare data to remove the positive skew (we cannot apply a log transform to values of zero - this produces -Inf values). To demonstrate this, let's add a constant of 0.0001 to all the Fare values and then apply the log transform...
+
+```{r}
+# Add 0.0001 to all fares
+titanic$Fare <- titanic$Fare+0.0001
+
+# now get log fare
+titanic$logFare <- log(titanic$Fare)
+
+# plot raw fare agains log fare
+par(mfrow=c(1,2))
+hist(titanic$Fare, freq=F, main='Fare: Original Data', 
+  col='darkgreen', ylim=c(0,0.02)) 
+hist(titanic$logFare, freq=F, main='Fare: Log', 
+  col='lightgreen', ylim=c(0,1))
+```
+
+Now we can see the problem - the log transformed fare data, like the original data, appears to have a somewhat binomial distribution due to the presence of those free tickets. Through eye-balling, the larger distribution in the log data appears to have a far more normal distribution than the raw fare data, which is heavily skewed. Let's remove the log data and the added constant we applied to compute it and try transforming the raw fare data to Z-scores to see if that reduces the skew.
+
+```{r}
+titanic$logFare <- NULL # remove logFare column
+
+titanic$Fare <- titanic$Fare-0.0001 # subtract the constant we applied earlier
+
+titanic$Fare_Zscore <- (titanic$Fare-mean(titanic$Fare, na.rm=TRUE))/sd(titanic$Fare, na.rm=TRUE)
+
+par(mfrow=c(1,2))
+hist(titanic$Fare, freq=F, main='Fare raw: Original Data', 
+  col='darkgreen', ylim=c(0,0.05)) 
+hist(titanic$Fare_Zscore, freq=F, main='Fare Z-scores', 
+  col='lightgreen', ylim=c(0,1))
+
+skewness(titanic$Fare, na.rm=TRUE) # old raw data
+skewness(titanic$Fare_Zscore, na.rm=TRUE) # Z-score data
+
+titanic$Fare_Zscore <- NULL # remove Fare Z-score column
+```
+
+The Z-scores are still very heavily skewed, indeed they have the same skew (4.785) value as the raw data. So despite our efforts it makes sense to stick with the raw data values.
+
+# Feature Engineering
+Now let's now create a new variable 'Title' (e.g., Mr, Ms, Mrs) by extracting this info from the Name variable. This idea was based on Megan Risdale's blog-
+https://www.kaggle.com/mrisdal/exploring-survival-on-the-titanic/notebook
+
+```{r}
+# First the titanic data (training data) - 
+
+titanic$Title <- gsub('(.*, )|(\\..*)', '', titanic$Name) # Grab title from passenger names
+
+# Show title counts by sex
+table(titanic$Sex, titanic$Title)
+
+# Titles with very low cell counts to be combined to "rare" level
+rare_title <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 
+                'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer')
+
+# Also reassign mlle, ms, and mme accordingly
+titanic$Title[titanic$Title == 'Mlle']        <- 'Miss' 
+titanic$Title[titanic$Title == 'Ms']          <- 'Miss'
+titanic$Title[titanic$Title == 'Mme']         <- 'Mrs' 
+titanic$Title[titanic$Title %in% rare_title]  <- 'Rare Title'
+
+# And now we do the same for the test data
+test$Title <- gsub('(.*, )|(\\..*)', '', test$Name)
+
+test$Title[test$Title == 'Mlle']        <- 'Miss' 
+test$Title[test$Title == 'Ms']          <- 'Miss'
+test$Title[test$Title == 'Mme']         <- 'Mrs' 
+test$Title[test$Title %in% rare_title]  <- 'Rare Title'
+
+# Show title counts by sex again
+table(test$Sex, test$Title)
+```
+
+Moving on, let's now create a new variable **isChild** with two levels (0 = adult, 1 = child) by extracting info from the age variable.
+
+```{r}
+# We'll use the age Z score imputed data as the raw age data has missing values. Let's work out the Z-score threshold to be classified as a child (i.e., < 18 years)? -
+Zscore_threshold <- (18-mean(titanic$Age, na.rm=TRUE))/sd(titanic$Age, na.rm=TRUE) 
+
+# Create the column child, and indicate whether child or adult
+titanic$isChild[titanic$age_Zscore_imput < Zscore_threshold] <- 1
+titanic$isChild[titanic$age_Zscore_imput >= Zscore_threshold] <- 0
+
+# Let's double checked that worked as planned on the training set by selecting the value that's closest but smaller than the threshold (this passenger should be classified as being a child)
+
+child_index <-which(titanic$age_Zscore_imput < Zscore_threshold) # get indices of all passengers with an age Z-score lower than our established Z-score threshold
+children <- titanic[child_index,] # select these passengers
+max_index <- which(children$Age==max(children$Age,na.rm=TRUE)) # from this subset of passengers, find the passenger with the highest value
+children[max_index[1],] # finally check their age - it should be less than 18 if our procedure is working accurately
+
+adult_index <-which(titanic$age_Zscore_imput == Zscore_threshold) # get indices of all passengers with an age Z-score equal to our established Z-score threshold
+adults <- titanic[adult_index,] # select these passengers
+adults[1,] # check that these passengers are have an age of 18 and are therefore adults
+
+# And now do the same for the test set (we need a slightly different threshold as the age Z-scores here were calculated on the training set)
+test$isChild[test$age_Zscore_imput <= -0.93] <- 1
+test$isChild[test$age_Zscore_imput > -0.93] <- 0
+
+# Let's double checked that worked as planned on the training set
+which(test$Age == 17)
+test[61,] # display data from the oldest possible child (Age should == 17)
+
+which(test$Age == 18)
+test[9,] # display data from the youngest possible adult (Age should == 18)
+
+# Show counts
+table(isChild=titanic$isChild,Survived= titanic$Survived)
+```
+
+So we can see that passangers under the age of 18 had around a 50% survival rate, while for adults this drops to around 36%. 
+
+# Basic data exploration
+First, let's take a quick look at the relationship between age, gender and survival in the training set.
+
+```{r}
+ggplot(titanic, aes(age_Zscore_imput, fill = factor(Survived))) + 
+  geom_histogram() + 
+  facet_grid(.~Sex) + 
+  theme_few()
+```
+
+First off, we can see there are more males than females but the frequency distribution across genders appears roughly similar. More importantly, we can clearly see that the proprtion of male survivors to non-survivors is substantially less than for females. 
+
+Now let's use featurePlot in the Caret package to get a further feel for the data and look for any particularly obvious trends in the training set amongst the other features.
+
+```{r}
+# To use featurePlot we need to convert character variables to factors
+titanic$Survived <- as.factor(titanic$Survived)
+titanic$Sex <- as.factor(titanic$Sex)
+titanic$Embarked <- as.factor(titanic$Embarked)
+titanic$Title <- as.factor(titanic$Title)
+
+featurePlot(x=titanic[,c("Pclass", "Sex", "age_Zscore_imput", "Fare", "Embarked", "Title", "isChild")],
+            y=titanic$Survived, plot="pairs")
+```
+
+The feature titles from bottom left to top right:
+Class / Gender / Age (Z-score) / Fare / Embarked / Title / isChild
+
+So there does not appear to be any one predictor that sticks out in terms of predicting survival, but we can see some basic trends (pink = survived, blue = did not survive): 
+(1) There's a greater age range for males vs. females and it looks like there's a better chance of surviving for younger males compared with older males. (2) There were a few people aged around 40 years who paid a far higher fare (pretty much more than double) the rest of the passengers, and it looks like these ultra-high paying outliers survived. (3) Passengers paid more for 1st class (unsurprising) than 2nd and 3rd class, and these 1st class passengers tended to have a greater survival rate than non-1st class passengers.
+
+Now let's plot age against the fare paid separately for survivors and non-survivors and add a linerar regression to each.
+
+```{r}
+#q-plots
+qq <- qplot(age_Zscore_imput, Fare,colour=Survived,data = titanic) #add linear regression model
+qq + geom_smooth(method = "lm", formula = y~x)
+```
+
+This plot shows an interesting relationship - firstly, survivors on average paid a higher fare than non-survivors but amongst survivors there's a positive correlation between age and the fare paid. In other words, the older the passenger the greater the fare they needed to pay to survive. Sorry grandpa. There was no such relationship between these features for the non-survivors.
+
+# Model Building
+## GLM
+Let's start with basic glm model (generalized linear model).
+
+```{r, warning = FALSE}
+# First, we partition the training dataset into a training and a validation set
+inTrain <-createDataPartition(y=titanic$Survived, p=0.7, list=FALSE)
+
+training <-titanic[inTrain,] # subset the data to the intraining set
+validation  <-titanic[-inTrain,] # subset the data for all samples that aren't in the training set (and are instead in the test set)
+dim(training); dim(validation) # Check dimensions
+
+
+# Fit a basic glm
+modFit_glm <- train(Survived ~ Pclass + Sex + age_Zscore_imput + SibSp + Parch + 
+                                            Fare + Embarked + Title + 
+                                            isChild, data=training, method="glm")
+
+# suppressWarnings(modFit_glm)
+
+print(modFit_glm)
+modFit_glm$finalModel # look at final model (watch out for high values - may simply be due to overfitting)
+```
+
+So the model produces an estimated accuracy of ~ 82% (Kappa = 0.61), let's test this on the validation data.
+
+```{r}
+predictions <- predict(modFit_glm,newdata=validation)
+
+#calculate confusion matrix to evaluate the predictions and pass the predictions from the model fit into the confusion matrix
+confusionMatrix(predictions,validation$Survived)
+```
+
+This produced an accuracy of ~ 84% (Kappa = 0.65), not too dissimilar from our estimated accuracy. Now let's separately apply it to the final test data and then save the predictions for the test data.
+
+```{r}
+# Apply to test set
+prediction <- predict(modFit_glm,newdata=test)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+solution_glm_1 <- data.frame(PassengerID = test$PassengerId, Survived = prediction)
+
+# Write the solution to file
+write.csv(solution_glm_1, file = 'glm_1_Solution.csv', row.names = F)
+```
+
+## K-means clustering
+
+Let's try some unsupervised learning in the form of k-means clustering to establish whether the algorithm can find patterns in the data corresponding to whether passengers survived. We'll run this on numerical features (we can't run this procedure on categorical features)
+
+First let's try with four numerical predictors - the age data (imputed Z-scores), the fare data, the number of siblings and the number of parents/children aboard.
+
+```{r}
+kMeans1 <- kmeans(training[,c(7,8,10,15)], 2, nstart = 20) # We specify 2 clusters corresponding to our binary variable "Survived"
+
+training$clusters <- as.factor(kMeans1$cluster) # add column with outcome of clustering procedure for each entry
+
+table(training$cluster, training$Survived) # compare the outcome to the real data
+
+```
+
+So we can see that two clusters were established as requested. Neither cluster reliably segregates survivors from non-survivors - ideally in both clusters we would have a high and a low number. Perhaps this was due to including two features that both contain a lot of zeros (the number of siblings and the number of parents/children aboard). Let's focus instead on just the fare and age features to see if that works better.
+
+```{r}
+kMeans1 <- kmeans(training[,c(10,15)], 2, nstart = 20) # this simply does the clustering
+
+training$clusters <- as.factor(kMeans1$cluster) # add column with outcome of clustering procedure for each entry
+
+qplot(age_Zscore_imput, Fare, colour = clusters, data = training) # plot the clustering
+
+qplot(age_Zscore_imput, Fare, colour = Survived, data = training) # plot the actual data for comparison
+
+table(training$cluster, training$Survived)
+```
+
+Comparing the plots we can see that the k-means classification produced the smallest cluster variation when it classifed anything with a fare above around 120 as one cluster and anything below as the second cluster (the first plot). Looking at the actual data (the second plot) shows that this doesn't correspond well to the actual data. Let's try an alternative approach: discriminant analysis.
+
+## Linear discriminant analysis versus Quadratic discriminant analysis
+
+LDA assumes features have a multivariate gaussian distribution with the same covariances for every class whereas QDA assumes different covariances. Let's see if either of these related procedures are more/less successful at predicting survival. First off - linear discriminant analysis...
+
+```{r, message= FALSE}
+# Linear discriminant analysis-
+mod_lda <- train(Survived ~., data =training[,c(2,3,5,7,8, 10,12,15,17)], method = "lda") # I dropped Title from the feature input as this feature was causing colinearity problems
+
+pred_lda = predict(mod_lda, validation)
+```
+
+And now for quadratic discriminant analysis...
+
+```{r}
+# Quadratic discriminant analysis-
+mod_qda <- train(Survived ~., data =training[,c(2,3,5,7,8, 10,12,15,17)], method = "qda")
+
+pred_qda = predict(mod_qda, validation);
+```
+
+Now let's see if they made different predictions...
+
+```{r}
+table(pred_lda,pred_qda)
+```
+
+So we can see the two procedures produced different predictions, let's check if either was more/less accurate.
+
+```{r}
+# Show the output for lda first then qda
+confusionMatrix(validation$Survived, predict(mod_lda, validation))
+confusionMatrix(validation$Survived, predict(mod_qda, validation))
+```
+
+So, when tested on the validation data we find that Quadratic discriminant analysis (the second model) edges Linear discriminant analysis (the first model) with an accuracy of 80.5% versus 79.7%. Let's apply the Quadratic discriminant analysis model to the testing set and save the predicted survival outcomes.
+
+```{r}
+# Predict using the test set
+prediction <- predict(mod_qda, test)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+solution_qda <- data.frame(PassengerID = test$PassengerId, Survived = prediction)
+
+# Write the solution to file
+write.csv(solution_qda, file = 'qda_mod_Solution.csv', row.names = F)
+```
+
+## Random forests
+Finally, let's apply the ensemble learning method 'random forest' algorithm to the training data and see if we can better tune the model to the dataset.
+
+```{r, message=FALSE}
+mod_rf <- train(Survived ~ Pclass + Sex + age_Zscore_imput + SibSp + Parch + 
+                                            Fare + Embarked + Title + 
+                                            isChild, data = training, method = 'rf', prox = TRUE) 
+# View model fit
+print(mod_rf)
+```
+
+So we get an estimated accuracy of ~81%. Now let's see how that compares to the accuracy when predicting our pre-defined test (validation) set
+
+```{r}
+# Predicting new values in testing set:
+pred <- predict(mod_rf, validation) # predict new values (classifications) based on model fit
+
+validation$predRight <- pred == validation$Survived # add column for classification accuracy of each data point in testing set
+
+predTable <-table(pred, validation$Survived) # display overall classification accuracy in a table
+
+print(predTable)
+```
+
+So we get 225 (148+77) correct predictions out of 266 (an accuracy of 84.6%). The compares pretty well to our estimated accuracy. Now, can we improve the model further by tuning it? Here we want to establish the best mtry value. This is the number of variables randomly sampled as candidates at each split. Note that the original best mtry value was 7.
+
+```{r}
+# Re-run the procedure a number of times randomising mtry to establish best mtry value
+control <- trainControl(method="repeatedcv", number=10, repeats=3, search="random")
+
+metric <- "Accuracy"
+
+mod_rf_multi <- train(Survived ~ Pclass + Sex + age_Zscore_imput + SibSp + Parch + 
+                                            Fare + Embarked + Title + 
+                                            isChild, data = training, method = 'rf', metric=metric, tuneLength=15, trControl=control)
+
+# Show & plot estimated accuracy for the different iterations
+print(mod_rf_multi)
+plot(mod_rf_multi)
+```
+
+So the best value used for the model was mtry = 4 with an accuracy of ~ 83.5%. Let's run the final tuned model on the validation data to see how it stands up.
+
+```{r}
+mtry <- 4
+
+tunegrid <- expand.grid(.mtry=mtry)
+
+mod_rf_multi_final <- train(Survived ~ Pclass + Sex + age_Zscore_imput + SibSp + Parch + 
+                                            Fare + Embarked + Title + 
+                                            isChild, data = validation, method = 'rf', metric=metric, tuneGrid=tunegrid, trControl=control)
+
+# View model fit
+print(mod_rf_multi_final)
+```
+
+Interestingly, this model performs worse on the validation set. Is the validation set a representative sample of the training set? Nontheless, let's take a look at which varibles in the model are having the largest effect on survival
+
+```{r}
+# Get ranked importance via regression coefficients (scaled to our data)
+varImp(mod_rf_multi_final, scale = FALSE)
+```
+
+This analysis suggests the fare paid to be the principal predictor of survival, with the age coming a close second. Now let's apply the model to the test data and save the predictions.
+
+```{r}
+# Predict using the test set
+prediction <- predict(mod_rf_multi_final, test)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+solution_rf <- data.frame(PassengerID = test$PassengerId, Survived = prediction)
+
+
+# Write the solution to file
+write.csv(solution_rf, file = 'rf_mod_Solution.csv', row.names = F)
+```
